@@ -9,6 +9,13 @@ using the nulling method:
 3. Measure: DRL = 10*log10(||residual||^2 / ||scaled_reference||^2)
 
 All operations maintain gradient flow for use as a loss function.
+
+Accepted input shapes:
+    - ``(T,)``       — single mono signal
+    - ``(C, T)``     — single multichannel signal (level-match per channel)
+    - ``(B, C, T)``  — batch of multichannel signals
+
+For a batch of mono signals, use ``(B, 1, T)``.
 """
 
 import math
@@ -71,7 +78,16 @@ class DRL(nn.Module):
     The level-matching step cancels any linear gain difference, so DRL
     measures only the nonlinear distortion component.
 
-    Supports optional band-wise analysis via FIR bandpass filtering.
+    Supports batch and multichannel inputs. Level-matching and DRL are
+    computed **per channel**; ``total_drl_db`` is the mean across all
+    batch elements and channels.
+
+    Accepted shapes:
+        - ``(T,)``       — single mono signal
+        - ``(C, T)``     — multichannel (e.g. stereo), one item
+        - ``(B, C, T)``  — batch of multichannel signals
+
+    For a batch of mono signals use ``(B, 1, T)``.
 
     Args:
         sample_rate: Audio sample rate in Hz.
@@ -120,25 +136,42 @@ class DRL(nn.Module):
             self.register_buffer(band_name, kernel.unsqueeze(0).unsqueeze(0))
             self._filter_kernels[(low, high)] = band_name
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_3d(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """Normalise input to ``(B, C, T)`` and return original ndim."""
+        ndim = x.dim()
+        if ndim == 1:
+            return x.unsqueeze(0).unsqueeze(0), ndim  # (1, 1, T)
+        if ndim == 2:
+            return x.unsqueeze(0), ndim  # (1, C, T)
+        if ndim == 3:
+            return x, ndim
+        raise ValueError(f"Expected 1-3D input, got {ndim}D")
+
     def _apply_bandpass(
         self,
         signal: torch.Tensor,
         low: float,
         high: float,
     ) -> torch.Tensor:
-        """Apply a pre-computed FIR bandpass filter to a signal."""
+        """Apply bandpass filter to ``(B, C, T)`` signal."""
         band_name = self._filter_kernels[(low, high)]
-        kernel = getattr(self, band_name)
-
-        if signal.dim() == 1:
-            signal = signal.unsqueeze(0).unsqueeze(0)
-        elif signal.dim() == 2:
-            signal = signal.unsqueeze(1)
-
+        kernel = getattr(self, band_name)  # (1, 1, num_taps)
         kernel = kernel.to(device=signal.device, dtype=signal.dtype)
+
+        B, C, T = signal.shape
+        x = signal.reshape(B * C, 1, T)
         padding = self.num_filter_taps // 2
-        filtered = F.conv1d(signal, kernel, padding=padding)
-        return filtered.squeeze()
+        filtered = F.conv1d(x, kernel, padding=padding)
+        return filtered.reshape(B, C, -1)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     @staticmethod
     def match_levels(
@@ -149,19 +182,21 @@ class DRL(nn.Module):
         """
         Scale reference to match processed level via least-squares projection.
 
-        Computes ``g_hat = <x, y> / <x, x>`` and returns ``g_hat * x``.
-        Fully differentiable w.r.t. both inputs.
+        Computes ``g_hat = <x, y> / <x, x>`` **per channel** (last dim is
+        time) and returns ``g_hat * x``.
+
+        Works on any shape ``(..., T)``.
 
         Args:
             reference: Reference (unprocessed) signal.
-            processed: Processed signal.
+            processed: Processed signal (same shape as *reference*).
             eps: Numerical stability constant.
 
         Returns:
-            Level-matched reference signal.
+            Level-matched reference signal (same shape as input).
         """
-        numerator = torch.dot(reference.flatten(), processed.flatten())
-        denominator = torch.dot(reference.flatten(), reference.flatten()) + eps
+        numerator = (reference * processed).sum(dim=-1, keepdim=True)
+        denominator = (reference * reference).sum(dim=-1, keepdim=True) + eps
         scale = numerator / denominator
         return reference * scale
 
@@ -175,63 +210,93 @@ class DRL(nn.Module):
         Compute DRL using the nulling method.
 
         Args:
-            reference: Original signal before processing.
-            processed: Signal after processing.
+            reference: Original signal — ``(T,)``, ``(C, T)``, or ``(B, C, T)``.
+            processed: Processed signal (same shape as *reference*).
             eps: Numerical stability constant.
 
         Returns:
             Dictionary with keys:
 
-            - ``total_drl_db``: Broadband DRL in dB (scalar).
-            - ``total_drl_percent``: DRL as percentage (scalar).
-            - ``band_drl_db``: Per-band DRL in dB (dict, empty if no bands).
-            - ``band_drl_percent``: Per-band DRL as percentage (dict).
-            - ``residual``: The distortion residual signal.
-            - ``residual_rms``: RMS of the residual.
-            - ``signal_rms``: RMS of the level-matched reference.
+            - ``total_drl_db``: Mean DRL in dB (scalar).
+            - ``total_drl_percent``: Mean DRL as percentage (scalar).
+            - ``channel_drl_db``: Per-channel DRL in dB.
+            - ``channel_drl_percent``: Per-channel DRL as percentage.
+            - ``band_drl_db``: Per-band mean DRL in dB (dict).
+            - ``band_drl_percent``: Per-band mean DRL as percentage (dict).
+            - ``residual``: Distortion residual signal.
+            - ``residual_rms``: Per-channel residual RMS.
+            - ``signal_rms``: Per-channel level-matched reference RMS.
+
+            Shapes of per-channel tensors match the input rank: scalar for
+            1-D input, ``(C,)`` for 2-D, ``(B, C)`` for 3-D.
         """
-        if reference.dim() > 1:
-            reference = reference.squeeze()
-        if processed.dim() > 1:
-            processed = processed.squeeze()
+        ref, ndim = self._to_3d(reference)
+        proc, _ = self._to_3d(processed)
 
-        min_len = min(len(reference), len(processed))
-        reference = reference[:min_len]
-        processed = processed[:min_len]
+        # Truncate to common length
+        min_len = min(ref.shape[-1], proc.shape[-1])
+        ref = ref[..., :min_len]
+        proc = proc[..., :min_len]
 
-        reference_scaled = self.match_levels(reference, processed)
-        residual = processed - reference_scaled
+        # Level-match per channel  — ref_scaled is (B, C, T)
+        ref_scaled = self.match_levels(ref, proc, eps)
+        residual = proc - ref_scaled
 
-        residual_power = torch.mean(residual**2)
-        signal_power = torch.mean(reference_scaled**2) + eps
+        # Power per channel — (B, C)
+        residual_power = torch.mean(residual**2, dim=-1)
+        signal_power = torch.mean(ref_scaled**2, dim=-1) + eps
 
-        drl_ratio = residual_power / signal_power
-        total_drl_db = 10 * torch.log10(drl_ratio + eps)
-        total_drl_percent = 100 * torch.sqrt(drl_ratio)
+        drl_ratio = residual_power / signal_power  # (B, C)
+        channel_drl_db = 10 * torch.log10(drl_ratio + eps)
+        channel_drl_pct = 100 * torch.sqrt(drl_ratio)
 
+        # Scalar totals (mean over batch and channels)
+        total_drl_db = channel_drl_db.mean()
+        total_drl_pct = channel_drl_pct.mean()
+
+        # Band analysis — scalars (mean over B, C)
         band_drl_db: Dict[str, torch.Tensor] = {}
         band_drl_percent: Dict[str, torch.Tensor] = {}
 
         for low, high in self.frequency_bands:
-            residual_band = self._apply_bandpass(residual, low, high)
-            reference_band = self._apply_bandpass(reference_scaled, low, high)
+            res_band = self._apply_bandpass(residual, low, high)
+            ref_band = self._apply_bandpass(ref_scaled, low, high)
 
-            band_residual_power = torch.mean(residual_band**2)
-            band_signal_power = torch.mean(reference_band**2) + eps
+            b_res_pow = torch.mean(res_band**2, dim=-1)  # (B, C)
+            b_sig_pow = torch.mean(ref_band**2, dim=-1) + eps
+            b_ratio = b_res_pow / b_sig_pow
 
-            band_ratio = band_residual_power / band_signal_power
-            band_name = f"{int(low)}_{int(high)}"
-            band_drl_db[band_name] = 10 * torch.log10(band_ratio + eps)
-            band_drl_percent[band_name] = 100 * torch.sqrt(band_ratio)
+            bname = f"{int(low)}_{int(high)}"
+            band_drl_db[bname] = (10 * torch.log10(b_ratio + eps)).mean()
+            band_drl_percent[bname] = (100 * torch.sqrt(b_ratio)).mean()
+
+        # Collapse per-channel tensors to match input rank
+        def _squeeze_bc(t: torch.Tensor) -> torch.Tensor:
+            """Squeeze a (B, C) tensor back to match input ndim."""
+            if ndim == 1:
+                return t.squeeze()  # scalar
+            if ndim == 2:
+                return t.squeeze(0)  # (C,)
+            return t  # (B, C)
+
+        def _squeeze_bct(t: torch.Tensor) -> torch.Tensor:
+            """Squeeze a (B, C, T) tensor back to match input ndim."""
+            if ndim == 1:
+                return t.squeeze(0).squeeze(0)  # (T,)
+            if ndim == 2:
+                return t.squeeze(0)  # (C, T)
+            return t  # (B, C, T)
 
         return {
             "total_drl_db": total_drl_db,
-            "total_drl_percent": total_drl_percent,
+            "total_drl_percent": total_drl_pct,
+            "channel_drl_db": _squeeze_bc(channel_drl_db),
+            "channel_drl_percent": _squeeze_bc(channel_drl_pct),
             "band_drl_db": band_drl_db,
             "band_drl_percent": band_drl_percent,
-            "residual": residual,
-            "residual_rms": torch.sqrt(residual_power),
-            "signal_rms": torch.sqrt(signal_power),
+            "residual": _squeeze_bct(residual),
+            "residual_rms": _squeeze_bc(torch.sqrt(residual_power)),
+            "signal_rms": _squeeze_bc(torch.sqrt(signal_power)),
         }
 
     def forward(
