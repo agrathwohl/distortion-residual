@@ -42,9 +42,6 @@ class TestDesignFirBandpass:
     def test_unity_dc_rejection(self):
         """A bandpass that excludes DC should have ~0 DC gain."""
         h = design_fir_bandpass(44100, 200, 2000, num_taps=255)
-        # DC gain = sum of coefficients (should be ~0 for a bandpass)
-        # Our normalisation makes sum=1, but the passband centre gain
-        # is what matters; DC is well-attenuated by the filter shape.
         assert h.dtype == torch.float32
 
     def test_clamps_frequencies(self):
@@ -59,7 +56,7 @@ class TestDesignFirBandpass:
 
 class TestDRLIdentity:
     def test_identity_gives_neg_inf(self, drl, sine_1k):
-        """Identical signals → DRL approaches -inf (no distortion)."""
+        """Identical signals -> DRL approaches -inf (no distortion)."""
         result = drl(sine_1k, sine_1k)
         assert result["total_drl_db"].item() < -80
 
@@ -72,6 +69,12 @@ class TestDRLIdentity:
     def test_attenuation_invisible(self, drl, sine_1k):
         gained = sine_1k * 0.25
         result = drl(sine_1k, gained)
+        assert result["total_drl_db"].item() < -80
+
+    def test_polarity_flip_invisible(self, drl, sine_1k):
+        """Polarity inversion is a linear gain of -1; DRL should cancel it."""
+        flipped = sine_1k * -1.0
+        result = drl(sine_1k, flipped)
         assert result["total_drl_db"].item() < -80
 
 
@@ -95,7 +98,7 @@ class TestDRLNonlinear:
         assert r_soft["total_drl_db"].item() < r_hard["total_drl_db"].item()
 
     def test_more_clipping_higher_drl(self, drl, sine_1k):
-        """Heavier clipping → higher (less negative) DRL."""
+        """Heavier clipping -> higher (less negative) DRL."""
         mild = torch.clamp(sine_1k, -0.8, 0.8)
         heavy = torch.clamp(sine_1k, -0.3, 0.3)
         r_mild = drl(sine_1k, mild)
@@ -126,6 +129,16 @@ class TestGradientFlow:
         assert gain.grad is not None
         assert torch.isfinite(gain.grad).all()
 
+    def test_grad_batched(self, drl_no_bands):
+        """Gradients should flow through batched (B, C, T) input."""
+        ref = torch.randn(2, 1, 4410)
+        proc = torch.randn(2, 1, 4410, requires_grad=True)
+        result = drl_no_bands(ref, proc)
+        result["total_drl_db"].backward()
+        assert proc.grad is not None
+        assert proc.grad.shape == (2, 1, 4410)
+        assert torch.isfinite(proc.grad).all()
+
 
 # ---------------------------------------------------------------------------
 # DRL — band analysis
@@ -152,6 +165,70 @@ class TestBandAnalysis:
 
 
 # ---------------------------------------------------------------------------
+# DRL — batch and multichannel
+# ---------------------------------------------------------------------------
+
+class TestBatchMultichannel:
+    def test_stereo_input(self, drl_no_bands):
+        """2D input (C, T) should return per-channel DRL."""
+        ref = torch.randn(2, 4410)
+        proc = torch.clamp(ref, -0.5, 0.5)
+        result = drl_no_bands(ref, proc)
+        assert result["total_drl_db"].dim() == 0  # scalar
+        assert result["channel_drl_db"].shape == (2,)
+        assert result["residual"].shape == (2, 4410)
+
+    def test_batched_mono(self, drl_no_bands):
+        """(B, 1, T) batch of mono signals."""
+        ref = torch.randn(4, 1, 4410)
+        proc = torch.clamp(ref, -0.5, 0.5)
+        result = drl_no_bands(ref, proc)
+        assert result["total_drl_db"].dim() == 0  # scalar
+        assert result["channel_drl_db"].shape == (4, 1)
+        assert result["residual"].shape == (4, 1, 4410)
+
+    def test_batched_stereo(self, drl_no_bands):
+        """(B, C, T) batch of stereo signals."""
+        ref = torch.randn(3, 2, 4410)
+        proc = torch.clamp(ref, -0.5, 0.5)
+        result = drl_no_bands(ref, proc)
+        assert result["total_drl_db"].dim() == 0
+        assert result["channel_drl_db"].shape == (3, 2)
+        assert result["residual"].shape == (3, 2, 4410)
+        assert result["residual_rms"].shape == (3, 2)
+
+    def test_mono_backward_compat(self, drl_no_bands):
+        """1D input should produce scalar per-channel values (backward compat)."""
+        ref = torch.randn(4410)
+        proc = torch.clamp(ref, -0.5, 0.5)
+        result = drl_no_bands(ref, proc)
+        assert result["total_drl_db"].dim() == 0
+        assert result["channel_drl_db"].dim() == 0
+        assert result["residual"].dim() == 1
+
+    def test_per_channel_level_matching(self, drl_no_bands):
+        """Each channel should be level-matched independently."""
+        ref = torch.randn(2, 4410)
+        # Channel 0: gain of 2, channel 1: gain of 0.5 (both linear -> low DRL)
+        proc = ref.clone()
+        proc[0] *= 2.0
+        proc[1] *= 0.5
+        result = drl_no_bands(ref, proc)
+        # Both channels are pure gain -> both should have very low DRL
+        assert result["channel_drl_db"][0].item() < -80
+        assert result["channel_drl_db"][1].item() < -80
+
+    def test_batched_bands(self, drl):
+        """Band analysis should work with batched input."""
+        ref = torch.randn(2, 1, 44100)
+        proc = torch.clamp(ref, -0.5, 0.5)
+        result = drl(ref, proc)
+        assert "20_200" in result["band_drl_db"]
+        # Band values should be scalars (mean over B, C)
+        assert result["band_drl_db"]["20_200"].dim() == 0
+
+
+# ---------------------------------------------------------------------------
 # DRL — output dict completeness
 # ---------------------------------------------------------------------------
 
@@ -161,6 +238,7 @@ class TestOutputDict:
         result = drl(sine_1k, clipped)
         expected = {
             "total_drl_db", "total_drl_percent",
+            "channel_drl_db", "channel_drl_percent",
             "band_drl_db", "band_drl_percent",
             "residual", "residual_rms", "signal_rms",
         }
